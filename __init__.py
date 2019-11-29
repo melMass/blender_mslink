@@ -246,7 +246,7 @@ class MS_Init_ImportProcess():
         parentName = "Principled BSDF"
         materialOutputName = "Material Output"
 
-        colorSpaces = ["sRGB", "Non-Color"]
+        colorSpaces = getColorspaces()
 
         mat.node_tree.nodes[parentName].distribution = 'MULTI_GGX'
         mat.node_tree.nodes[parentName].inputs[4].default_value = 1 if self.isMetal else 0 # Metallic value
@@ -576,7 +576,7 @@ class MS_Init_ImportProcess():
         parentName = "Principled BSDF"
         materialOutputName = "Material Output"
 
-        colorSpaces = ["sRGB", "Non-Color"]
+        colorSpaces = getColorspaces()
 
         mat.node_tree.nodes[parentName].distribution = 'MULTI_GGX'
         mat.node_tree.nodes[parentName].inputs[4].default_value = 1 if self.isMetal else 0 # Metallic value
@@ -840,7 +840,7 @@ class MS_Init_ImportProcess():
         parentName = "Principled BSDF"
         materialOutputName = "Material Output"
 
-        colorSpaces = ["sRGB", "Non-Color"]
+        colorSpaces = getColorspaces()
 
         mat.node_tree.nodes[parentName].distribution = 'MULTI_GGX'
         mat.node_tree.nodes[parentName].inputs[4].default_value = 1 if self.isMetal else 0 # Metallic value
@@ -1111,7 +1111,7 @@ class MS_Init_ImportProcess():
         parentName = "Principled BSDF"
         materialOutputName = "Material Output"
 
-        colorSpaces = ["sRGB", "Non-Color"]
+        colorSpaces = getColorspaces()
 
         mat.node_tree.nodes[parentName].distribution = 'MULTI_GGX'
         mat.node_tree.nodes[parentName].inputs[4].default_value = 1 if self.isMetal else 0 # Metallic value
@@ -1512,6 +1512,12 @@ def show_error_dialog(self, context, message = "Test message."):
 
 def menu_func_import(self, context):
     self.layout.operator(MS_Init_LiveLink.bl_idname, text="Megascans LiveLink")
+
+def getColorspaces():
+    if os.environ.get("OCIO"):
+        return ["Utility - sRGB - Texture", "Utility - Raw"]
+    else:
+        return ["sRGB", "Non-Color"]
 
 def register():
     bpy.utils.register_class(MS_Init_LiveLink)
