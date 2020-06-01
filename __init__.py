@@ -1,6 +1,6 @@
-# ##### QUIXEL AB - MEGASCANS LIVELINK FOR BLENDER #####
+# ##### QUIXEL AB - MEGASCANS PLugin FOR BLENDER #####
 #
-# The Megascans LiveLink plugin for Blender is an add-on that lets
+# The Megascans Plugin  plugin for Blender is an add-on that lets
 # you instantly import assets with their shader setup with one click only.
 #
 # Because it relies on some of the latest 2.80 features, this plugin is currently
@@ -9,17 +9,23 @@
 # You are free to modify, add features or tweak this add-on as you see fit, and
 # don't hesitate to send us some feedback if you've done something cool with it.
 #
-# ##### QUIXEL AB - MEGASCANS LIVELINK FOR BLENDER #####
+# ##### QUIXEL AB - MEGASCANS PLUGIN FOR BLENDER #####
 
 import bpy, threading, os, time, json, socket
+from bpy.app.handlers import persistent
 
 globals()['Megascans_DataSet'] = None
 
+# This stuff is for the Alembic support
+globals()['MG_Material'] = []
+globals()['MG_AlembicPath'] = []
+globals()['MG_ImportComplete'] = False
+
 bl_info = {
-    "name": "Megascans LiveLink",
+    "name": "Megascans Plugin",
     "description": "Connects Blender to Quixel Bridge for one-click imports with shader setup and geometry",
     "author": "Quixel",
-    "version": (2, 2),
+    "version": (3, 1),
     "blender": (2, 80, 0),
     "location": "File > Import",
     "warning": "", # used for warning icon and text in addons panel
@@ -35,15 +41,19 @@ bl_info = {
 
 class MS_Init_ImportProcess():
 
-    def __init__(self):
     # This initialization method create the data structure to process our assets
     # later on in the initImportProcess method. The method loops on all assets
     # that have been sent by Bridge.
-
+    def __init__(self):
         print("Initialized import class...")
         try:
             # Check if there's any incoming data
             if globals()['Megascans_DataSet'] != None:
+
+                globals()['MG_AlembicPath'] = []
+                globals()['MG_Material'] = []
+                globals()['MG_ImportComplete'] = False
+
                 self.json_Array = json.loads(globals()['Megascans_DataSet'])
 
                 # Start looping over each asset in the self.json_Array list
@@ -69,38 +79,56 @@ class MS_Init_ImportProcess():
                     self.isScatterAsset = self.CheckScatterAsset()
                     self.textureList = []
                     self.isBillboard = self.CheckIsBillboard()
+                    self.ApplyToSelection = False
+                    self.isSpecularWorkflow = True
+                    self.isAlembic = False
+
+                    self.NormalSetup = False
+                    self.BumpSetup = False
+
+                    if "workflow" in self.json_data.keys():
+                        self.isSpecularWorkflow = bool(self.json_data["workflow"] == "specular")
+
+                    if "applyToSelection" in self.json_data.keys():
+                        self.ApplyToSelection = bool(self.json_data["applyToSelection"])
 
                     if (self.isCycles):
                         if(bpy.context.scene.cycles.feature_set == 'EXPERIMENTAL'):
                             self.DisplacementSetup = 'adaptive'
-
-
-                    baseTextures = ["albedo", "diffuse", "displacement", "normal", "roughness",
-                                    "specular", "normalbump", "ao", "opacity",
-                                    "translucency", "gloss", "metalness", "bump", "fuzz"]
                     
-                    texturesObjectName = "components"
+                    texturesListName = "components"
                     if(self.isBillboard):
-                        texturesObjectName = "components"
+                        texturesListName = "components"
 
-                    # Create a list of tuples of all the textures maps available.
-                    # This tuple is composed of (textureFormat, textureMapType, texturePath)
-                    for obj in self.json_data[texturesObjectName]:
-                        if obj["type"] in baseTextures:
-                            if(obj["type"] == "displacement") and self.DisplacementSetup == 'adaptive':
-                                #Do the EXR displacement thingy.
-                                if (obj["format"] != "exr"):
-                                    disp_path_recv = obj["path"]
-                                    k = disp_path_recv.rfind(obj["format"]) # k is the last index for where the file format starts in the string.
-                                    disp_path_exr = disp_path_recv[:k] + "exr" # we appead exr as file type to check if it exists.
-                                    if(os.path.isfile(disp_path_exr)):
-                                        self.textureList.append(("exr", obj["type"], disp_path_exr)) # if EXR displacement exists we can safely use it.
-                                    else:
-                                        self.textureList.append( (obj["format"], obj["type"], obj["path"]))
-                                else:
-                                    self.textureList.append( (obj["format"], obj["type"], obj["path"]))
-                            else:
-                                self.textureList.append( (obj["format"], obj["type"], obj["path"]) )
+                    # Get a list of all available texture maps. item[1] returns the map type (albedo, normal, etc...).
+                    self.textureTypes = [obj["type"] for obj in self.json_data[texturesListName]]
+                    self.textureList = []
+
+                    for obj in self.json_data[texturesListName]:
+                        texFormat = obj["format"]
+                        texType = obj["type"]
+                        texPath = obj["path"]
+
+                        if texType == "displacement" and texFormat != "exr":
+                            texDir = os.path.dirname(texPath)
+                            texName = os.path.splitext(os.path.basename(texPath))[0]
+
+                            if os.path.exists(os.path.join(texDir, texName + ".exr")):
+                                texPath = os.path.join(texDir, texName + ".exr")
+                                texFormat = "exr"
+                        # Replace diffuse texture type with albedo so we don't have to add more conditions to handle diffuse map.
+                        if texType == "diffuse" and "albedo" not in self.textureTypes:
+                            texType = "albedo"
+                            self.textureTypes.append("albedo")
+                            self.textureTypes.remove("diffuse")
+
+                        # Normal / Bump setup checks
+                        if texType == "normal":
+                            self.NormalSetup = True
+                        if texType == "bump":
+                            self.BumpSetup = True
+
+                        self.textureList.append((texFormat, texType, texPath))
 
                     # Create a tuple list of all the 3d meshes  available.
                     # This tuple is composed of (meshFormat, meshPath)
@@ -117,43 +145,45 @@ class MS_Init_ImportProcess():
                         self.assetName = "_".join(self.assetName.split("_")[:-1])
 
                     self.materialName = self.assetName + '_' + self.assetID
+                    self.colorSpaces = ["sRGB", "Non-Color", "Linear"]
 
                     # Initialize the import method to start building our shader and import our geometry
                     self.initImportProcess()
                     print("Imported asset from " + self.assetName + " Quixel Bridge")
-
+        
+            if len(globals()['MG_AlembicPath']) > 0:
+                globals()['MG_ImportComplete'] = True        
         except Exception as e:
-            print( "Megascans LiveLink Error initializing the import process. Error: ", str(e) )
-
-
+            print( "Megascans Plugin Error initializing the import process. Error: ", str(e) )
+        
         globals()['Megascans_DataSet'] = None
+    
     # this method is used to import the geometry and create the material setup.
     def initImportProcess(self):
         try:
             if len(self.textureList) >= 1:
+                
+                if(self.ApplyToSelection and self.assetType not in ["3dplant", "3d"]):
+                    self.CollectSelectedObjects()
 
                 self.ImportGeometry()
-                mat = self.CreateMaterial()
-                self.ApplyMaterialToGeometry(mat)
+                self.CreateMaterial()
+                self.ApplyMaterialToGeometry()
                 if(self.isScatterAsset and len(self.selectedObjects) > 1):
                     self.ScatterAssetSetup()
 
-                if self.assetType == "3d":
-                    self.SetupMaterial3DAsset(mat)
-                elif self.assetType == "3dplant":
-                    self.SetupMaterial3DPlant(mat)
-                else:
-                    if self.isMetal:
-                        self.SetupMaterial2DMetal(mat)
-                    else:
-                        self.SetupMaterial2D(mat)
+                self.SetupMaterial()
+
+                if self.isAlembic:
+                    globals()['MG_Material'].append(self.mat)
 
         except Exception as e:
-            print( "Megascans LiveLink Error while importing textures/geometry or setting up material. Error: ", str(e) )
+            print( "Megascans Plugin Error while importing textures/geometry or setting up material. Error: ", str(e) )
 
     def ImportGeometry(self):
         try:
             # Import geometry
+            abcPaths = []
             if len(self.geometryList) >= 1:
                 for obj in self.geometryList:
                     meshPath = obj[1]
@@ -166,47 +196,42 @@ class MS_Init_ImportProcess():
                         self.selectedObjects += obj_objects
 
                     elif meshFormat.lower() == "obj":
-                        bpy.ops.import_scene.obj(filepath=meshPath)
+                        bpy.ops.import_scene.obj(filepath=meshPath, use_split_objects = True, use_split_groups = True, global_clight_size = 1.0)
                         # get selected objects
                         obj_objects = [ o for o in bpy.context.scene.objects if o.select_get() ]
                         self.selectedObjects += obj_objects
 
-                    elif meshFormat.lower() == "abc" and False:
-                        # self.dump(bpy.context)
-                        # return
-                        # for window in bpy.context.window_manager.windows:
-                        #     for area in window.screen.areas:
-                        # #for area in bpy.context.screen.areas:
-                        #         if area.type == 'FILE_BROWSER' or area.type == 'OUTLINER':
-                        #             override = bpy.context.copy()
-                        #             override['area'] = area
-                        #             bpy.ops.wm.alembic_import(override, filepath=meshPath, as_background_job=False)
-                        #             break
-                        # area = bpy.context.area
-                        # old_type = area.type
-                        # area.type = 'VIEW_3D'
-                        bpy.ops.wm.alembic_import({}, filepath=meshPath, as_background_job=False)
-                        # area.type = old_type
-                        # get selected objects
-                        obj_objects = [ o for o in bpy.context.scene.objects if o.select_get() ]
-                        self.selectedObjects += obj_objects
+                    elif meshFormat.lower() == "abc":
+                        self.isAlembic = True
+                        abcPaths.append(meshPath)
+            
+            if self.isAlembic:
+                globals()['MG_AlembicPath'].append(abcPaths)
+            
+            if bpy.data.scenes[0].display_settings.display_device == "ACES":
+                self.colorSpaces = ["Utility - sRGB - Texture", "Utility - Raw", "Utility - Linear - sRGB"]
+            else:
+                self.colorSpaces = ["sRGB", "Non-Color", "Linear"]
         except Exception as e:
-            print( "Megascans LiveLink Error while importing textures/geometry or setting up material. Error: ", str(e) )
+            print( "Megascans Plugin Error while importing textures/geometry or setting up material. Error: ", str(e) )
 
     def dump(self, obj):
         for attr in dir(obj):
             print("obj.%s = %r" % (attr, getattr(obj, attr)))
 
-    def CreateMaterial(self):
-        # Create material
-        mat = (bpy.data.materials.get( self.materialName ) or bpy.data.materials.new( self.materialName ))
-        mat.use_nodes = True
-        return mat
+    def CollectSelectedObjects(self):
+        try:
+            sceneSelectedObjects = [ o for o in bpy.context.scene.objects if o.select_get() ]
+            for obj in sceneSelectedObjects:
+                if obj.type == "MESH":
+                    self.selectedObjects.append(obj)
+        except Exception as e:
+            print("Megascans Plugin Error::CollectSelectedObjects::", str(e) )
 
-    def ApplyMaterialToGeometry(self, mat):
+    def ApplyMaterialToGeometry(self):
         for obj in self.selectedObjects:
             # assign material to obj
-            obj.active_material = mat
+            obj.active_material = self.mat
 
     def CheckScatterAsset(self):
         if('scatter' in self.json_data['categories'] or 'scatter' in self.json_data['tags']):
@@ -217,7 +242,6 @@ class MS_Init_ImportProcess():
         # Use billboard textures if importing the Billboard LOD.
         if(self.assetType == "3dplant"):
             if (self.activeLOD == self.minLOD):
-                # print("It is billboard LOD.")
                 return True
         return False
 
@@ -236,1150 +260,194 @@ class MS_Init_ImportProcess():
     #         # assign material to obj
     #         bpy.ops.object.modifier_add(type='SOLIDIFY')
 
-    #Shader setups for different asset types
-    def SetupMaterial2D (self, mat):
-        print("Setting up material for 2D surface (non-metal)")
-
-        nodes = mat.node_tree.nodes
-        # Get a list of all available texture maps. item[1] returns the map type (albedo, normal, etc...).
-        maps_ = [item[1] for item in self.textureList]
-        parentName = "Principled BSDF"
-        materialOutputName = "Material Output"
-
-        colorSpaces = getColorspaces()
-
-        mat.node_tree.nodes[parentName].distribution = 'MULTI_GGX'
-        mat.node_tree.nodes[parentName].inputs[4].default_value = 1 if self.isMetal else 0 # Metallic value
-        mat.node_tree.nodes[parentName].inputs[14].default_value = self.IOR
-
-        if self.isCycles:
-            # Create mapping node.
-            mappingNode = nodes.new("ShaderNodeMapping")
-            mappingNode.location = (-1950, 0)
-            mappingNode.vector_type = 'TEXTURE'
-            # Create texture coordinate node.
-            texCoordNode = nodes.new("ShaderNodeTexCoord")
-            texCoordNode.location = (-2150, -200)
-            # Connect texCoordNode to the mappingNode
-            mat.node_tree.links.new(mappingNode.inputs[0], texCoordNode.outputs[0])
-
-        use_diffuse = True
-        # Create the albedo x ao setup.
-        if "albedo" in maps_:
-            if "ao" in maps_:
-                albedoPath = [item[2] for item in self.textureList if item[1] == "albedo"]
-                aoPath = [item[2] for item in self.textureList if item[1] == "ao"]
-                if len(albedoPath) >= 1 and  len(aoPath) >= 1:
-                    use_diffuse = False
-                    #Add Color>MixRGB node, transform it in the node editor, change it's operation to Multiply and finally we colapse the node.
-                    multiplyNode = nodes.new("ShaderNodeMixRGB")
-                    multiplyNode.blend_type = 'MULTIPLY'
-                    multiplyNode.location = (-250, 320)
-                    #Import albedo and albedo node setup.
-                    albedoPath = albedoPath[0].replace("\\", "/")
-                    albedoNode = nodes.new('ShaderNodeTexImage')
-                    albedoNode.location = (-640, 460)
-                    albedoNode.image = bpy.data.images.load(albedoPath)
-                    albedoNode.show_texture = True
-                    albedoNode.image.colorspace_settings.name = colorSpaces[0]
-                    #Import ao and ao node setup.
-                    aoPath = aoPath[0].replace("\\", "/")
-                    aoNode = nodes.new('ShaderNodeTexImage')
-                    aoNode.location = (-640, 200)
-                    aoNode.image = bpy.data.images.load(aoPath)
-                    aoNode.show_texture = True
-                    aoNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Conned albedo and ao node to the multiply node.
-                    mat.node_tree.links.new(multiplyNode.inputs[1], albedoNode.outputs[0])
-                    mat.node_tree.links.new(multiplyNode.inputs[2], aoNode.outputs[0])
-                    # Connect multiply node to the material parent node.
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[0], multiplyNode.outputs[0])
-                    # Add mapping node connection in order to support tiling
-                    if self.isCycles:
-                        mat.node_tree.links.new(albedoNode.inputs[0], mappingNode.outputs[0])
-                        mat.node_tree.links.new(aoNode.inputs[0], mappingNode.outputs[0])
+    #Shader setups for all asset types. Some type specific functionality is also handled here.
+    def SetupMaterial (self):
+        if "albedo" in self.textureTypes:
+            if "ao" in self.textureTypes:
+                self.CreateTextureMultiplyNode("albedo", "ao", -250, 320, -640, 460, -640, 200, 0, 1, True, 0)
             else:
-                albedoPath = [item[2] for item in self.textureList if item[1] == "albedo"]
-                if len(albedoPath) >= 1:
-                    use_diffuse = False
-                    #Import albedo and albedo node setup.
-                    albedoPath = albedoPath[0].replace("\\", "/")
-                    albedoNode = nodes.new('ShaderNodeTexImage')
-                    albedoNode.location = (-640, 420)
-                    albedoNode.image = bpy.data.images.load(albedoPath)
-                    albedoNode.show_texture = True
-                    albedoNode.image.colorspace_settings.name = colorSpaces[0]
-                    # Connect albedo node to the material parent node.
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[0], albedoNode.outputs[0])
-                    # Add mapping node connection in order to support tiling
-                    if self.isCycles:
-                        mat.node_tree.links.new(albedoNode.inputs[0], mappingNode.outputs[0])
-
-        # Create the diffuse setup.
-        if "diffuse" in maps_ and use_diffuse:
-            diffusePath = [item[2] for item in self.textureList if item[1] == "diffuse"]
-            if len(diffusePath) >= 1:
-                # Import diffuse and diffuse node setup.
-                diffusePath = diffusePath[0].replace("\\", "/")
-                diffuseNode = nodes.new('ShaderNodeTexImage')
-                diffuseNode.location = (-640, 420)
-                diffuseNode.image = bpy.data.images.load(diffusePath)
-                diffuseNode.show_texture = True
-                diffuseNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect diffuse node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[0], diffuseNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(diffuseNode.inputs[0], mappingNode.outputs[0])
+                self.CreateTextureNode("albedo", -640, 420, 0, True, 0)
         
-        use_metalness = True
-        # Create the specular setup.
-        if "specular" in maps_:
-            specularPath = [item[2] for item in self.textureList if item[1] == "specular"]
-            if len(specularPath) >= 1:
-                use_metalness = False
-                # Import specular and specular node setup.
-                specularPath = specularPath[0].replace("\\", "/")
-                specularNode = nodes.new('ShaderNodeTexImage')
-                specularNode.location = (-1150, 200)
-                specularNode.image = bpy.data.images.load(specularPath)
-                specularNode.show_texture = True
-                specularNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect specular node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[5], specularNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(specularNode.inputs[0], mappingNode.outputs[0])
-
-        # Create the metalness setup. Use metalness if specular is missing
-        if "metalness" in maps_ and use_metalness:
-            metalnessPath = [item[2] for item in self.textureList if item[1] == "metalness"]
-            if len(metalnessPath) >= 1:
-                # Import specular and specular node setup.
-                metalnessPath = metalnessPath[0].replace("\\", "/")
-                metalnessNode = nodes.new('ShaderNodeTexImage')
-                metalnessNode.location = (-1150, 200)
-                metalnessNode.image = bpy.data.images.load(metalnessPath)
-                metalnessNode.show_texture = True
-                metalnessNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect specular node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[4], metalnessNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(metalnessNode.inputs[0], mappingNode.outputs[0])
-
-        use_gloss = True
-        # Create the roughness setup.
-        if "roughness" in maps_:
-            roughnessPath = [item[2] for item in self.textureList if item[1] == "roughness"]
-            if len(roughnessPath) >= 1:
-                use_gloss = False
-                # Import roughness and roughness node setup.
-                roughnessPath = roughnessPath[0].replace("\\", "/")
-                roughnessNode = nodes.new('ShaderNodeTexImage')
-                roughnessNode.location = (-1150, -60)
-                roughnessNode.image = bpy.data.images.load(roughnessPath)
-                roughnessNode.show_texture = True
-                roughnessNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect roughness node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[7], roughnessNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(roughnessNode.inputs[0], mappingNode.outputs[0])
-        
-        # Create the gloss setup.
-        if "gloss" in maps_ and use_gloss:
-            glossPath = [item[2] for item in self.textureList if item[1] == "gloss"]
-            if len(glossPath) >= 1:
-                # Add vector>bump node
-                invertNode = nodes.new("ShaderNodeInvert")
-                invertNode.location = (-250, 68)
-                # Import roughness and roughness node setup.
-                glossPath = glossPath[0].replace("\\", "/")
-                glossNode = nodes.new('ShaderNodeTexImage')
-                glossNode.location = (-1150, -60)
-                glossNode.image = bpy.data.images.load(glossPath)
-                glossNode.show_texture = True
-                glossNode.image.colorspace_settings.name = colorSpaces[1]
+        if self.isSpecularWorkflow:
+            if "specular" in self.textureTypes:
+                self.CreateTextureNode("specular", -1150, 200, 0, True, 5)
+            
+            if "gloss" in self.textureTypes:
+                glossNode = self.CreateTextureNode("gloss", -1150, -60)
+                invertNode = self.CreateGenericNode("ShaderNodeInvert", -250, 60)
                 # Add glossNode to invertNode connection
-                mat.node_tree.links.new(invertNode.inputs[1], glossNode.outputs[0])
+                self.mat.node_tree.links.new(invertNode.inputs[1], glossNode.outputs[0])
                 # Connect roughness node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[7], invertNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(glossNode.inputs[0], mappingNode.outputs[0])
-
-        # Create the opacity setup.
-        if "opacity" in maps_:
-            opacityPath = [item[2] for item in self.textureList if item[1] == "opacity"]
-            if len(opacityPath) >= 1:
-                # Import opacity and opacity node setup.
-                opacityPath = opacityPath[0].replace("\\", "/")
-                opacityNode = nodes.new('ShaderNodeTexImage')
-                opacityNode.location = (-1550, -160)
-                opacityNode.image = bpy.data.images.load(opacityPath)
-                opacityNode.show_texture = True
-                opacityNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect opacity node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[18], opacityNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(opacityNode.inputs[0], mappingNode.outputs[0])
-
-        # Create the translucency setup.
-        if "translucency" in maps_:
-            translucencyPath = [item[2] for item in self.textureList if item[1] == "translucency"]
-            if len(translucencyPath) >= 1:
-                # Import translucency and translucency node setup.
-                translucencyPath = translucencyPath[0].replace("\\", "/")
-                translucencyNode = nodes.new('ShaderNodeTexImage')
-                translucencyNode.location = (-1550, -420)
-                translucencyNode.image = bpy.data.images.load(translucencyPath)
-                translucencyNode.show_texture = True
-                translucencyNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect translucency node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[15], translucencyNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(translucencyNode.inputs[0], mappingNode.outputs[0])
-
-        setup_normal = True
-        # Create the normal + bump setup.
-        if "normal" in maps_ and "bump" in maps_:
-            normalPath = [item[2] for item in self.textureList if item[1] == "normal"]
-            bumpPath = [item[2] for item in self.textureList if item[1] == "bump"]
-            if len(normalPath) >= 1 and  len(bumpPath) >= 1:
-                setup_normal = False
-                # Add vector>bump node
-                bumpNode = nodes.new("ShaderNodeBump")
-                bumpNode.location = (-250, -170)
-                bumpNode.inputs[0].default_value = 0.1
-                # Import bump map and bump map node setup.
-                bumpPath = bumpPath[0].replace("\\", "/")
-                bumpMapNode = nodes.new('ShaderNodeTexImage')
-                bumpMapNode.location = (-640, -130)
-                bumpMapNode.image = bpy.data.images.load(bumpPath)
-                bumpMapNode.show_texture = True
-                bumpMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add vector>normal map node
-                normalNode = nodes.new("ShaderNodeNormalMap")
-                normalNode.location = (-640, -400)
-                # Import normal map and normal map node setup.
-                normalPath = normalPath[0].replace("\\", "/")
-                normalMapNode = nodes.new('ShaderNodeTexImage')
-                normalMapNode.location = (-1150, -580)
-                normalMapNode.image = bpy.data.images.load(normalPath)
-                normalMapNode.show_texture = True
-                normalMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add normalMapNode to normalNode connection
-                mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
-                # Add bumpMapNode and normalNode connection to the bumpNode
-                mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
-                mat.node_tree.links.new(bumpNode.inputs[3], normalNode.outputs[0])
-                # Add bumpNode connection to the material parent node
-                mat.node_tree.links.new(nodes.get(parentName).inputs[19], bumpNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(normalMapNode.inputs[0], mappingNode.outputs[0])
-                    mat.node_tree.links.new(bumpMapNode.inputs[0], mappingNode.outputs[0])
-
-        # Create the normal setup if the LiveLink did not setup normal + bump.
-        if "normal" in maps_ and setup_normal:
-            normalPath = [item[2] for item in self.textureList if item[1] == "normal"]
-            if len(normalPath) >= 1:
-                setup_normal = False
-                # Add vector>normal map node
-                normalNode = nodes.new("ShaderNodeNormalMap")
-                normalNode.location = (-250, -170)
-                # Import normal map and normal map node setup.
-                normalPath = normalPath[0].replace("\\", "/")
-                normalMapNode = nodes.new('ShaderNodeTexImage')
-                normalMapNode.location = (-640, -207)
-                normalMapNode.image = bpy.data.images.load(normalPath)
-                normalMapNode.show_texture = True
-                normalMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add normalMapNode to normalNode connection
-                mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
-                # Add normalNode connection to the material parent node
-                mat.node_tree.links.new(nodes.get(parentName).inputs[19], normalNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(normalMapNode.inputs[0], mappingNode.outputs[0])
-
-        # Create the normal setup if the LiveLink did not setup normal + bump.
-        if "bump" in maps_ and setup_normal:
-            bumpPath = [item[2] for item in self.textureList if item[1] == "bump"]
-            if len(bumpPath) >= 1:
-                setup_normal = False
-                # Add vector>bump node
-                bumpNode = nodes.new("ShaderNodeBump")
-                bumpNode.location = (-250, -170)
-                bumpNode.inputs[0].default_value = 0.1
-                # Import bump map and bump map node setup.
-                bumpPath = bumpPath[0].replace("\\", "/")
-                bumpMapNode = nodes.new('ShaderNodeTexImage')
-                bumpMapNode.location = (-640, -207)
-                bumpMapNode.image = bpy.data.images.load(bumpPath)
-                bumpMapNode.show_texture = True
-                bumpMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add bumpMapNode and normalNode connection to the bumpNode
-                mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
-                # Add bumpNode connection to the material parent node
-                mat.node_tree.links.new(nodes.get(parentName).inputs[19], bumpNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(bumpMapNode.inputs[0], mappingNode.outputs[0])
-    
-        # Create the displacement setup.
-        if "displacement" in maps_:
-            if self.DisplacementSetup == "adaptive":
-                displacementPath = [item[2] for item in self.textureList if item[1] == "displacement"]
-                if len(displacementPath) >= 1:
-                    # Add vector>displacement map node
-                    displacementNode = nodes.new("ShaderNodeDisplacement")
-                    displacementNode.location = (10, -400)
-                    displacementNode.inputs[0].default_value = 0.1
-                    displacementNode.inputs[1].default_value = 0
-                    # Add converter>RGB Separator node
-                    RGBSplitterNode = nodes.new("ShaderNodeSeparateRGB")
-                    RGBSplitterNode.location = (-250, -499)
-                    # Import normal map and normal map node setup.
-                    displacementPath = displacementPath[0].replace("\\", "/")
-                    displacementMapNode = nodes.new('ShaderNodeTexImage')
-                    displacementMapNode.location = (-640, -740)
-                    displacementMapNode.image = bpy.data.images.load(displacementPath)
-                    displacementMapNode.show_texture = True
-                    displacementMapNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Add displacementMapNode to RGBSplitterNode connection
-                    mat.node_tree.links.new(RGBSplitterNode.inputs[0], displacementMapNode.outputs[0])
-                    # Add RGBSplitterNode to displacementNode connection
-                    mat.node_tree.links.new(displacementNode.inputs[2], RGBSplitterNode.outputs[0])
-                    # Add normalNode connection to the material output displacement node
-                    mat.node_tree.links.new(nodes.get(materialOutputName).inputs[2], displacementNode.outputs[0])
-                    mat.cycles.displacement_method = 'BOTH'
-                    # Add mapping node connection in order to support tiling
-                    if self.isCycles:
-                        mat.node_tree.links.new(displacementMapNode.inputs[0], mappingNode.outputs[0])
-
-            if self.DisplacementSetup == "regular":
-                pass
-
-        return
-
-    def SetupMaterial2DMetal (self, mat):
-        print("Setting up material for 2D surface (metal)")
-        print("Setting up material for 2D surface (non-metal)")
-
-        nodes = mat.node_tree.nodes
-        # Get a list of all available texture maps. item[1] returns the map type (albedo, normal, etc...).
-        maps_ = [item[1] for item in self.textureList]
-        parentName = "Principled BSDF"
-        materialOutputName = "Material Output"
-
-        colorSpaces = getColorspaces()
-
-        mat.node_tree.nodes[parentName].distribution = 'MULTI_GGX'
-        mat.node_tree.nodes[parentName].inputs[4].default_value = 1 if self.isMetal else 0 # Metallic value
-        mat.node_tree.nodes[parentName].inputs[14].default_value = self.IOR
-
-        if self.isCycles:
-            # Create mapping node.
-            mappingNode = nodes.new("ShaderNodeMapping")
-            mappingNode.location = (-1950, 0)
-            mappingNode.vector_type = 'TEXTURE'
-            # Create texture coordinate node.
-            texCoordNode = nodes.new("ShaderNodeTexCoord")
-            texCoordNode.location = (-2150, -200)
-            # Connect texCoordNode to the mappingNode
-            mat.node_tree.links.new(mappingNode.inputs[0], texCoordNode.outputs[0])
-
-        use_diffuse = True
-        # Create the albedo x ao setup.
-        if "albedo" in maps_:
-            albedoPath = [item[2] for item in self.textureList if item[1] == "albedo"]
-            if len(albedoPath) >= 1:
-                use_diffuse = False
-                #Import albedo and albedo node setup.
-                albedoPath = albedoPath[0].replace("\\", "/")
-                albedoNode = nodes.new('ShaderNodeTexImage')
-                albedoNode.location = (-640, 420)
-                albedoNode.image = bpy.data.images.load(albedoPath)
-                albedoNode.show_texture = True
-                albedoNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect albedo node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[0], albedoNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(albedoNode.inputs[0], mappingNode.outputs[0])
-
-        use_metalness = True
-        # Create the diffuse setup.
-        if "diffuse" in maps_ and use_diffuse:
-            diffusePath = [item[2] for item in self.textureList if item[1] == "diffuse"]
-            if len(diffusePath) >= 1:
-                use_metalness = False or "specular" not in maps_
-                # Import diffuse and diffuse node setup.
-                diffusePath = diffusePath[0].replace("\\", "/")
-                diffuseNode = nodes.new('ShaderNodeTexImage')
-                diffuseNode.location = (-640, 420)
-                diffuseNode.image = bpy.data.images.load(diffusePath)
-                diffuseNode.show_texture = True
-                diffuseNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect diffuse node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[0], diffuseNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(diffuseNode.inputs[0], mappingNode.outputs[0])
-        
-        use_specular = True
-        # Create the metalness setup. Use metalness if specular is missing
-        if "metalness" in maps_ and use_metalness:
-            metalnessPath = [item[2] for item in self.textureList if item[1] == "metalness"]
-            if len(metalnessPath) >= 1:
-                use_specular = False
-                # Import specular and specular node setup.
-                metalnessPath = metalnessPath[0].replace("\\", "/")
-                metalnessNode = nodes.new('ShaderNodeTexImage')
-                metalnessNode.location = (-1150, 200)
-                metalnessNode.image = bpy.data.images.load(metalnessPath)
-                metalnessNode.show_texture = True
-                metalnessNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect specular node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[4], metalnessNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(metalnessNode.inputs[0], mappingNode.outputs[0])
-
-        # Create the specular setup.
-        if "specular" in maps_ and use_specular:
-            specularPath = [item[2] for item in self.textureList if item[1] == "specular"]
-            if len(specularPath) >= 1:
-                use_metalness = False
-                # Import specular and specular node setup.
-                specularPath = specularPath[0].replace("\\", "/")
-                specularNode = nodes.new('ShaderNodeTexImage')
-                specularNode.location = (-1150, 200)
-                specularNode.image = bpy.data.images.load(specularPath)
-                specularNode.show_texture = True
-                specularNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect specular node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[5], specularNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(specularNode.inputs[0], mappingNode.outputs[0])
-
-        use_gloss = True
-        # Create the roughness setup.
-        if "roughness" in maps_:
-            roughnessPath = [item[2] for item in self.textureList if item[1] == "roughness"]
-            if len(roughnessPath) >= 1:
-                use_gloss = False
-                # Import roughness and roughness node setup.
-                roughnessPath = roughnessPath[0].replace("\\", "/")
-                roughnessNode = nodes.new('ShaderNodeTexImage')
-                roughnessNode.location = (-1150, -60)
-                roughnessNode.image = bpy.data.images.load(roughnessPath)
-                roughnessNode.show_texture = True
-                roughnessNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect roughness node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[7], roughnessNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(roughnessNode.inputs[0], mappingNode.outputs[0])
-        
-        # Create the gloss setup.
-        if "gloss" in maps_ and use_gloss:
-            glossPath = [item[2] for item in self.textureList if item[1] == "gloss"]
-            if len(glossPath) >= 1:
-                # Add vector>bump node
-                invertNode = nodes.new("ShaderNodeInvert")
-                invertNode.location = (-250, 68)
-                # Import roughness and roughness node setup.
-                glossPath = glossPath[0].replace("\\", "/")
-                glossNode = nodes.new('ShaderNodeTexImage')
-                glossNode.location = (-1150, -60)
-                glossNode.image = bpy.data.images.load(glossPath)
-                glossNode.show_texture = True
-                glossNode.image.colorspace_settings.name = colorSpaces[1]
+                self.mat.node_tree.links.new(self.nodes.get(self.parentName).inputs[7], invertNode.outputs[0])
+            elif "roughness" in self.textureTypes:
+                self.CreateTextureNode("roughness", -1150, -60, 1, True, 7)
+        else:
+            if "metalness" in self.textureTypes:
+                self.CreateTextureNode("metalness", -1150, 200, 1, True, 4)
+            
+            if "roughness" in self.textureTypes:
+                self.CreateTextureNode("roughness", -1150, -60, 1, True, 7)
+            elif "gloss" in self.textureTypes:
+                glossNode = self.CreateTextureNode("gloss", -1150, -60)
+                invertNode = self.CreateGenericNode("ShaderNodeInvert", -250, 60)
                 # Add glossNode to invertNode connection
-                mat.node_tree.links.new(invertNode.inputs[1], glossNode.outputs[0])
+                self.mat.node_tree.links.new(invertNode.inputs[1], glossNode.outputs[0])
                 # Connect roughness node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[7], invertNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(glossNode.inputs[0], mappingNode.outputs[0])
+                self.mat.node_tree.links.new(self.nodes.get(self.parentName).inputs[7], invertNode.outputs[0])
+            
+        if "opacity" in self.textureTypes:
+            self.CreateTextureNode("opacity", -1550, -160, 1, True, 18)
+            self.mat.blend_method = 'HASHED'
 
-        setup_normal = True
-        # Create the normal + bump setup.
-        if "normal" in maps_ and "bump" in maps_:
-            normalPath = [item[2] for item in self.textureList if item[1] == "normal"]
-            bumpPath = [item[2] for item in self.textureList if item[1] == "bump"]
-            if len(normalPath) >= 1 and  len(bumpPath) >= 1:
-                setup_normal = False
-                # Add vector>bump node
-                bumpNode = nodes.new("ShaderNodeBump")
-                bumpNode.location = (-250, -170)
-                bumpNode.inputs[0].default_value = 0.1
-                # Import bump map and bump map node setup.
-                bumpPath = bumpPath[0].replace("\\", "/")
-                bumpMapNode = nodes.new('ShaderNodeTexImage')
-                bumpMapNode.location = (-640, -130)
-                bumpMapNode.image = bpy.data.images.load(bumpPath)
-                bumpMapNode.show_texture = True
-                bumpMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add vector>normal map node
-                normalNode = nodes.new("ShaderNodeNormalMap")
-                normalNode.location = (-640, -400)
-                # Import normal map and normal map node setup.
-                normalPath = normalPath[0].replace("\\", "/")
-                normalMapNode = nodes.new('ShaderNodeTexImage')
-                normalMapNode.location = (-1150, -580)
-                normalMapNode.image = bpy.data.images.load(normalPath)
-                normalMapNode.show_texture = True
-                normalMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add normalMapNode to normalNode connection
-                mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
-                # Add bumpMapNode and normalNode connection to the bumpNode
-                mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
-                mat.node_tree.links.new(bumpNode.inputs[3], normalNode.outputs[0])
-                # Add bumpNode connection to the material parent node
-                mat.node_tree.links.new(nodes.get(parentName).inputs[19], bumpNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(normalMapNode.inputs[0], mappingNode.outputs[0])
-                    mat.node_tree.links.new(bumpMapNode.inputs[0], mappingNode.outputs[0])
-
-        # Create the normal setup if the LiveLink did not setup normal + bump.
-        if "normal" in maps_ and setup_normal:
-            normalPath = [item[2] for item in self.textureList if item[1] == "normal"]
-            if len(normalPath) >= 1:
-                setup_normal = False
-                # Add vector>normal map node
-                normalNode = nodes.new("ShaderNodeNormalMap")
-                normalNode.location = (-250, -170)
-                # Import normal map and normal map node setup.
-                normalPath = normalPath[0].replace("\\", "/")
-                normalMapNode = nodes.new('ShaderNodeTexImage')
-                normalMapNode.location = (-640, -207)
-                normalMapNode.image = bpy.data.images.load(normalPath)
-                normalMapNode.show_texture = True
-                normalMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add normalMapNode to normalNode connection
-                mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
-                # Add normalNode connection to the material parent node
-                mat.node_tree.links.new(nodes.get(parentName).inputs[19], normalNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(normalMapNode.inputs[0], mappingNode.outputs[0])
-
-        # Create the normal setup if the LiveLink did not setup normal + bump.
-        if "bump" in maps_ and setup_normal:
-            bumpPath = [item[2] for item in self.textureList if item[1] == "bump"]
-            if len(bumpPath) >= 1:
-                setup_normal = False
-                # Add vector>bump node
-                bumpNode = nodes.new("ShaderNodeBump")
-                bumpNode.location = (-250, -170)
-                bumpNode.inputs[0].default_value = 0.1
-                # Import bump map and bump map node setup.
-                bumpPath = bumpPath[0].replace("\\", "/")
-                bumpMapNode = nodes.new('ShaderNodeTexImage')
-                bumpMapNode.location = (-640, -207)
-                bumpMapNode.image = bpy.data.images.load(bumpPath)
-                bumpMapNode.show_texture = True
-                bumpMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add bumpMapNode and normalNode connection to the bumpNode
-                mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
-                # Add bumpNode connection to the material parent node
-                mat.node_tree.links.new(nodes.get(parentName).inputs[19], bumpNode.outputs[0])
-                # Add mapping node connection in order to support tiling
-                if self.isCycles:
-                    mat.node_tree.links.new(bumpMapNode.inputs[0], mappingNode.outputs[0])
-    
-        # Create the displacement setup.
-        if "displacement" in maps_:
-            if self.DisplacementSetup == "adaptive":
-                displacementPath = [item[2] for item in self.textureList if item[1] == "displacement"]
-                if len(displacementPath) >= 1:
-                    # Add vector>displacement map node
-                    displacementNode = nodes.new("ShaderNodeDisplacement")
-                    displacementNode.location = (10, -400)
-                    displacementNode.inputs[0].default_value = 0.1
-                    displacementNode.inputs[1].default_value = 0
-                    # Add converter>RGB Separator node
-                    RGBSplitterNode = nodes.new("ShaderNodeSeparateRGB")
-                    RGBSplitterNode.location = (-250, -499)
-                    # Import normal map and normal map node setup.
-                    displacementPath = displacementPath[0].replace("\\", "/")
-                    displacementMapNode = nodes.new('ShaderNodeTexImage')
-                    displacementMapNode.location = (-640, -740)
-                    displacementMapNode.image = bpy.data.images.load(displacementPath)
-                    displacementMapNode.show_texture = True
-                    displacementMapNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Add displacementMapNode to RGBSplitterNode connection
-                    mat.node_tree.links.new(RGBSplitterNode.inputs[0], displacementMapNode.outputs[0])
-                    # Add RGBSplitterNode to displacementNode connection
-                    mat.node_tree.links.new(displacementNode.inputs[2], RGBSplitterNode.outputs[0])
-                    # Add normalNode connection to the material output displacement node
-                    mat.node_tree.links.new(nodes.get(materialOutputName).inputs[2], displacementNode.outputs[0])
-                    mat.cycles.displacement_method = 'BOTH'
-                    # Add mapping node connection in order to support tiling
-                    if self.isCycles:
-                        mat.node_tree.links.new(displacementMapNode.inputs[0], mappingNode.outputs[0])
-
-            if self.DisplacementSetup == "regular":
-                pass
-        return
-    
-    def SetupMaterial3DAsset (self, mat):
-        print("Setting up material for 3D Asset.")
-        
-        nodes = mat.node_tree.nodes
-        # Get a list of all available texture maps. item[1] returns the map type (albedo, normal, etc...).
-        maps_ = [item[1] for item in self.textureList]
-        parentName = "Principled BSDF"
-        materialOutputName = "Material Output"
-
-        colorSpaces = getColorspaces()
-
-        mat.node_tree.nodes[parentName].distribution = 'MULTI_GGX'
-        mat.node_tree.nodes[parentName].inputs[4].default_value = 1 if self.isMetal else 0 # Metallic value
-        mat.node_tree.nodes[parentName].inputs[14].default_value = self.IOR
-
-        use_diffuse = True
-        # Create the albedo x ao setup.
-        if "albedo" in maps_:
-            if "ao" in maps_:
-                albedoPath = [item[2] for item in self.textureList if item[1] == "albedo"]
-                aoPath = [item[2] for item in self.textureList if item[1] == "ao"]
-                if len(albedoPath) >= 1 and  len(aoPath) >= 1:
-                    use_diffuse = False
-                    #Add Color>MixRGB node, transform it in the node editor, change it's operation to Multiply and finally we colapse the node.
-                    multiplyNode = nodes.new("ShaderNodeMixRGB")
-                    multiplyNode.blend_type = 'MULTIPLY'
-                    multiplyNode.location = (-250, 320)
-                    #Import albedo and albedo node setup.
-                    albedoPath = albedoPath[0].replace("\\", "/")
-                    albedoNode = nodes.new('ShaderNodeTexImage')
-                    albedoNode.location = (-640, 460)
-                    albedoNode.image = bpy.data.images.load(albedoPath)
-                    albedoNode.show_texture = True
-                    albedoNode.image.colorspace_settings.name = colorSpaces[0]
-                    #Import ao and ao node setup.
-                    aoPath = aoPath[0].replace("\\", "/")
-                    aoNode = nodes.new('ShaderNodeTexImage')
-                    aoNode.location = (-640, 200)
-                    aoNode.image = bpy.data.images.load(aoPath)
-                    aoNode.show_texture = True
-                    aoNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Conned albedo and ao node to the multiply node.
-                    mat.node_tree.links.new(multiplyNode.inputs[1], albedoNode.outputs[0])
-                    mat.node_tree.links.new(multiplyNode.inputs[2], aoNode.outputs[0])
-                    # Connect multiply node to the material parent node.
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[0], multiplyNode.outputs[0])
-            else:
-                albedoPath = [item[2] for item in self.textureList if item[1] == "albedo"]
-                if len(albedoPath) >= 1:
-                    use_diffuse = False
-                    #Import albedo and albedo node setup.
-                    albedoPath = albedoPath[0].replace("\\", "/")
-                    albedoNode = nodes.new('ShaderNodeTexImage')
-                    albedoNode.location = (-640, 420)
-                    albedoNode.image = bpy.data.images.load(albedoPath)
-                    albedoNode.show_texture = True
-                    albedoNode.image.colorspace_settings.name = colorSpaces[0]
-                    # Connect albedo node to the material parent node.
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[0], albedoNode.outputs[0])
-
-        # Create the diffuse setup.
-        if "diffuse" in maps_ and use_diffuse:
-            diffusePath = [item[2] for item in self.textureList if item[1] == "diffuse"]
-            if len(diffusePath) >= 1:
-                # Import diffuse and diffuse node setup.
-                diffusePath = diffusePath[0].replace("\\", "/")
-                diffuseNode = nodes.new('ShaderNodeTexImage')
-                diffuseNode.location = (-640, 420)
-                diffuseNode.image = bpy.data.images.load(diffusePath)
-                diffuseNode.show_texture = True
-                diffuseNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect diffuse node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[0], diffuseNode.outputs[0])
-        
-        use_metalness = True
-        # Create the specular setup.
-        if "specular" in maps_:
-            specularPath = [item[2] for item in self.textureList if item[1] == "specular"]
-            if len(specularPath) >= 1:
-                use_metalness = False
-                # Import specular and specular node setup.
-                specularPath = specularPath[0].replace("\\", "/")
-                specularNode = nodes.new('ShaderNodeTexImage')
-                specularNode.location = (-1150, 200)
-                specularNode.image = bpy.data.images.load(specularPath)
-                specularNode.show_texture = True
-                specularNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect specular node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[5], specularNode.outputs[0])
-
-        # Create the metalness setup. Use metalness if specular is missing
-        if "metalness" in maps_ and use_metalness:
-            metalnessPath = [item[2] for item in self.textureList if item[1] == "metalness"]
-            if len(metalnessPath) >= 1:
-                # Import specular and specular node setup.
-                metalnessPath = metalnessPath[0].replace("\\", "/")
-                metalnessNode = nodes.new('ShaderNodeTexImage')
-                metalnessNode.location = (-1150, 200)
-                metalnessNode.image = bpy.data.images.load(metalnessPath)
-                metalnessNode.show_texture = True
-                metalnessNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect specular node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[4], metalnessNode.outputs[0])
-
-        use_gloss = True
-        # Create the roughness setup.
-        if "roughness" in maps_:
-            roughnessPath = [item[2] for item in self.textureList if item[1] == "roughness"]
-            if len(roughnessPath) >= 1:
-                use_gloss = False
-                # Import roughness and roughness node setup.
-                roughnessPath = roughnessPath[0].replace("\\", "/")
-                roughnessNode = nodes.new('ShaderNodeTexImage')
-                roughnessNode.location = (-1150, -60)
-                roughnessNode.image = bpy.data.images.load(roughnessPath)
-                roughnessNode.show_texture = True
-                roughnessNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect roughness node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[7], roughnessNode.outputs[0])
-        
-        # Create the gloss setup.
-        if "gloss" in maps_ and use_gloss:
-            glossPath = [item[2] for item in self.textureList if item[1] == "gloss"]
-            if len(glossPath) >= 1:
-                # Add vector>bump node
-                invertNode = nodes.new("ShaderNodeInvert")
-                invertNode.location = (-250, 68)
-                # Import roughness and roughness node setup.
-                glossPath = glossPath[0].replace("\\", "/")
-                glossNode = nodes.new('ShaderNodeTexImage')
-                glossNode.location = (-1150, -60)
-                glossNode.image = bpy.data.images.load(glossPath)
-                glossNode.show_texture = True
-                glossNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add glossNode to invertNode connection
-                mat.node_tree.links.new(invertNode.inputs[1], glossNode.outputs[0])
-                # Connect roughness node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[7], invertNode.outputs[0])
+        if "translucency" in self.textureTypes:
+            self.CreateTextureNode("translucency", -1550, -420, 0, True, 15)
 
         # If HIGH POLY selected > use normal_bump and no displacement
         # If LODs selected > use corresponding LODs normal + displacement
         if self.isHighPoly:
-            # Create the normal setup if the LiveLink did not setup normal + bump.
-            if "normal" in maps_:
-                normalPath = [item[2] for item in self.textureList if item[1] == "normal"]
-                if len(normalPath) >= 1:
-                    setup_normal = False
-                    # Add vector>normal map node
-                    normalNode = nodes.new("ShaderNodeNormalMap")
-                    normalNode.location = (-250, -170)
-                    # Import normal map and normal map node setup.
-                    normalPath = normalPath[0].replace("\\", "/")
-                    normalMapNode = nodes.new('ShaderNodeTexImage')
-                    normalMapNode.location = (-640, -207)
-                    normalMapNode.image = bpy.data.images.load(normalPath)
-                    normalMapNode.show_texture = True
-                    normalMapNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Add normalMapNode to normalNode connection
-                    mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
-                    # Add normalNode connection to the material parent node
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[19], normalNode.outputs[0])
-        else:
-            setup_normal = True
-            # Create the normal + bump setup.
-            if "normal" in maps_ and "bump" in maps_:
-                normalPath = [item[2] for item in self.textureList if item[1] == "normal"]
-                bumpPath = [item[2] for item in self.textureList if item[1] == "bump"]
-                if len(normalPath) >= 1 and  len(bumpPath) >= 1:
-                    setup_normal = False
-                    # Add vector>bump node
-                    bumpNode = nodes.new("ShaderNodeBump")
-                    bumpNode.location = (-250, -170)
-                    bumpNode.inputs[0].default_value = 0.1
-                    # Import bump map and bump map node setup.
-                    bumpPath = bumpPath[0].replace("\\", "/")
-                    bumpMapNode = nodes.new('ShaderNodeTexImage')
-                    bumpMapNode.location = (-640, -130)
-                    bumpMapNode.image = bpy.data.images.load(bumpPath)
-                    bumpMapNode.show_texture = True
-                    bumpMapNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Add vector>normal map node
-                    normalNode = nodes.new("ShaderNodeNormalMap")
-                    normalNode.location = (-640, -400)
-                    # Import normal map and normal map node setup.
-                    normalPath = normalPath[0].replace("\\", "/")
-                    normalMapNode = nodes.new('ShaderNodeTexImage')
-                    normalMapNode.location = (-1150, -580)
-                    normalMapNode.image = bpy.data.images.load(normalPath)
-                    normalMapNode.show_texture = True
-                    normalMapNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Add normalMapNode to normalNode connection
-                    mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
-                    # Add bumpMapNode and normalNode connection to the bumpNode
-                    mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
-                    mat.node_tree.links.new(bumpNode.inputs[3], normalNode.outputs[0])
-                    # Add bumpNode connection to the material parent node
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[19], bumpNode.outputs[0])
+            self.BumpSetup = False
+        self.CreateNormalNodeSetup(True, 19)
 
-            # Create the normal setup if the LiveLink did not setup normal + bump.
-            if "normal" in maps_ and setup_normal:
-                normalPath = [item[2] for item in self.textureList if item[1] == "normal"]
-                if len(normalPath) >= 1:
-                    setup_normal = False
-                    # Add vector>normal map node
-                    normalNode = nodes.new("ShaderNodeNormalMap")
-                    normalNode.location = (-250, -170)
-                    # Import normal map and normal map node setup.
-                    normalPath = normalPath[0].replace("\\", "/")
-                    normalMapNode = nodes.new('ShaderNodeTexImage')
-                    normalMapNode.location = (-640, -207)
-                    normalMapNode.image = bpy.data.images.load(normalPath)
-                    normalMapNode.show_texture = True
-                    normalMapNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Add normalMapNode to normalNode connection
-                    mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
-                    # Add normalNode connection to the material parent node
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[19], normalNode.outputs[0])
+        if "displacement" in self.textureTypes and not self.isHighPoly:
+            self.CreateDisplacementSetup(True)
 
-            # Create the normal setup if the LiveLink did not setup normal + bump.
-            if "bump" in maps_ and setup_normal:
-                bumpPath = [item[2] for item in self.textureList if item[1] == "bump"]
-                if len(bumpPath) >= 1:
-                    setup_normal = False
-                    # Add vector>bump node
-                    bumpNode = nodes.new("ShaderNodeBump")
-                    bumpNode.location = (-250, -170)
-                    bumpNode.inputs[0].default_value = 0.1
-                    # Import bump map and bump map node setup.
-                    bumpPath = bumpPath[0].replace("\\", "/")
-                    bumpMapNode = nodes.new('ShaderNodeTexImage')
-                    bumpMapNode.location = (-640, -207)
-                    bumpMapNode.image = bpy.data.images.load(bumpPath)
-                    bumpMapNode.show_texture = True
-                    bumpMapNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Add bumpMapNode and normalNode connection to the bumpNode
-                    mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
-                    # Add bumpNode connection to the material parent node
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[19], bumpNode.outputs[0])
+    def CreateMaterial(self):
+        self.mat = (bpy.data.materials.get( self.materialName ) or bpy.data.materials.new( self.materialName ))
+        self.mat.use_nodes = True
+        self.nodes = self.mat.node_tree.nodes
+        self.parentName = "Principled BSDF"
+        self.materialOutputName = "Material Output"
+
+        self.mat.node_tree.nodes[self.parentName].distribution = 'MULTI_GGX'
+        self.mat.node_tree.nodes[self.parentName].inputs[4].default_value = 1 if self.isMetal else 0 # Metallic value
+        self.mat.node_tree.nodes[self.parentName].inputs[14].default_value = self.IOR
         
-            # Create the displacement setup.
-            if "displacement" in maps_:
-                if self.DisplacementSetup == "adaptive":
-                    displacementPath = [item[2] for item in self.textureList if item[1] == "displacement"]
-                    if len(displacementPath) >= 1:
-                        # Add vector>displacement map node
-                        displacementNode = nodes.new("ShaderNodeDisplacement")
-                        displacementNode.location = (10, -400)
-                        displacementNode.inputs[0].default_value = 0.1
-                        displacementNode.inputs[1].default_value = 0
-                        # Add converter>RGB Separator node
-                        RGBSplitterNode = nodes.new("ShaderNodeSeparateRGB")
-                        RGBSplitterNode.location = (-250, -499)
-                        # Import normal map and normal map node setup.
-                        displacementPath = displacementPath[0].replace("\\", "/")
-                        displacementMapNode = nodes.new('ShaderNodeTexImage')
-                        displacementMapNode.location = (-640, -740)
-                        displacementMapNode.image = bpy.data.images.load(displacementPath)
-                        displacementMapNode.show_texture = True
-                        displacementMapNode.image.colorspace_settings.name = colorSpaces[1]
-                        # Add displacementMapNode to RGBSplitterNode connection
-                        mat.node_tree.links.new(RGBSplitterNode.inputs[0], displacementMapNode.outputs[0])
-                        # Add RGBSplitterNode to displacementNode connection
-                        mat.node_tree.links.new(displacementNode.inputs[2], RGBSplitterNode.outputs[0])
-                        # Add normalNode connection to the material output displacement node
-                        mat.node_tree.links.new(nodes.get(materialOutputName).inputs[2], displacementNode.outputs[0])
-                        mat.cycles.displacement_method = 'BOTH'
+        self.mappingNode = None
 
-                if self.DisplacementSetup == "regular":
-                    pass
-        return
+        if self.isCycles and self.assetType not in ["3d", "3dplant"]:
+            # Create mapping node.
+            self.mappingNode = self.CreateGenericNode("ShaderNodeMapping", -1950, 0)
+            self.mappingNode.vector_type = 'TEXTURE'
+            # Create texture coordinate node.
+            texCoordNode = self.CreateGenericNode("ShaderNodeTexCoord", -2150, -200)
+            # Connect texCoordNode to the mappingNode
+            self.mat.node_tree.links.new(self.mappingNode.inputs[0], texCoordNode.outputs[0])
+
+    def CreateTextureNode(self, textureType, PosX, PosY, colorspace = 1, connectToMaterial = False, materialInputIndex = 0):
+        texturePath = self.GetTexturePath(textureType)
+        textureNode = self.CreateGenericNode('ShaderNodeTexImage', PosX, PosY)
+        textureNode.image = bpy.data.images.load(texturePath)
+        textureNode.show_texture = True
+        textureNode.image.colorspace_settings.name = self.colorSpaces[colorspace] # "sRGB", "Non-Color", "Linear"
         
-    def SetupMaterial3DPlant (self, mat):
-        print("Setting up material for 3D Plant.")
+        if textureType in ["albedo", "specular", "translucency"]:
+            if self.GetTextureFormat(textureType) in "exr":
+                textureNode.image.colorspace_settings.name = self.colorSpaces[2] # "sRGB", "Non-Color", "Linear"
+
+        if connectToMaterial:
+            self.ConnectNodeToMaterial(materialInputIndex, textureNode)
+        # If it is Cycles render we connect it to the mapping node.
+        if self.isCycles and self.assetType not in ["3d", "3dplant"]:
+            self.mat.node_tree.links.new(textureNode.inputs[0], self.mappingNode.outputs[0])
+        return textureNode
+
+    def CreateTextureMultiplyNode(self, aTextureType, bTextureType, PosX, PosY, aPosX, aPosY, bPosX, bPosY, aColorspace, bColorspace, connectToMaterial, materialInputIndex):
+        #Add Color>MixRGB node, transform it in the node editor, change it's operation to Multiply and finally we colapse the node.
+        multiplyNode = self.CreateGenericNode('ShaderNodeMixRGB', PosX, PosY)
+        multiplyNode.blend_type = 'MULTIPLY'
+        #Setup A and B nodes
+        textureNodeA = self.CreateTextureNode(aTextureType, aPosX, aPosY, aColorspace)
+        textureNodeB = self.CreateTextureNode(bTextureType, bPosX, bPosY, bColorspace)
+        # Conned albedo and ao node to the multiply node.
+        self.mat.node_tree.links.new(multiplyNode.inputs[1], textureNodeA.outputs[0])
+        self.mat.node_tree.links.new(multiplyNode.inputs[2], textureNodeB.outputs[0])
+
+        if connectToMaterial:
+            self.ConnectNodeToMaterial(materialInputIndex, multiplyNode)
+
+        return multiplyNode
+
+    def CreateNormalNodeSetup(self, connectToMaterial, materialInputIndex):
         
-        nodes = mat.node_tree.nodes
-        # Get a list of all available texture maps. item[1] returns the map type (albedo, normal, etc...).
-        maps_ = [item[1] for item in self.textureList]
-        parentName = "Principled BSDF"
-        materialOutputName = "Material Output"
+        bumpNode = None
+        normalNode = None
+        bumpMapNode = None
+        normalMapNode = None
 
-        colorSpaces = getColorspaces()
-
-        mat.node_tree.nodes[parentName].distribution = 'MULTI_GGX'
-        mat.node_tree.nodes[parentName].inputs[4].default_value = 1 if self.isMetal else 0 # Metallic value
-        mat.node_tree.nodes[parentName].inputs[14].default_value = self.IOR
-
-        if (self.assetType == "3dplant" and self.isBillboard):
-            mat.blend_method = 'BLEND'
-
-        use_diffuse = True
-        # Create the albedo x ao setup.
-        if "albedo" in maps_:
-            if "ao" in maps_:
-                albedoPath = [item[2] for item in self.textureList if item[1] == "albedo"]
-                aoPath = [item[2] for item in self.textureList if item[1] == "ao"]
-                if len(albedoPath) >= 1 and  len(aoPath) >= 1:
-                    use_diffuse = False
-                    #Add Color>MixRGB node, transform it in the node editor, change it's operation to Multiply and finally we colapse the node.
-                    multiplyNode = nodes.new("ShaderNodeMixRGB")
-                    multiplyNode.blend_type = 'MULTIPLY'
-                    multiplyNode.location = (-250, 320)
-                    #Import albedo and albedo node setup.
-                    albedoPath = albedoPath[0].replace("\\", "/")
-                    albedoNode = nodes.new('ShaderNodeTexImage')
-                    albedoNode.location = (-640, 460)
-                    albedoNode.image = bpy.data.images.load(albedoPath)
-                    albedoNode.show_texture = True
-                    albedoNode.image.colorspace_settings.name = colorSpaces[0]
-                    #Import ao and ao node setup.
-                    aoPath = aoPath[0].replace("\\", "/")
-                    aoNode = nodes.new('ShaderNodeTexImage')
-                    aoNode.location = (-640, 200)
-                    aoNode.image = bpy.data.images.load(aoPath)
-                    aoNode.show_texture = True
-                    aoNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Conned albedo and ao node to the multiply node.
-                    mat.node_tree.links.new(multiplyNode.inputs[1], albedoNode.outputs[0])
-                    mat.node_tree.links.new(multiplyNode.inputs[2], aoNode.outputs[0])
-                    # Connect multiply node to the material parent node.
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[0], multiplyNode.outputs[0])
+        if self.NormalSetup and self.BumpSetup:
+            bumpMapNode = self.CreateTextureNode("bump", -640, -130)
+            normalMapNode = self.CreateTextureNode("normal", -1150, -580)
+            bumpNode = self.CreateGenericNode("ShaderNodeBump", -250, -170)
+            bumpNode.inputs[0].default_value = 0.1
+            normalNode = self.CreateGenericNode("ShaderNodeNormalMap", -640, -400)
+            # Add normalMapNode to normalNode connection
+            self.mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
+            # Add bumpMapNode and normalNode connection to the bumpNode
+            self.mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
+            if (2, 81, 0) > bpy.app.version:
+                self.mat.node_tree.links.new(bumpNode.inputs[3], normalNode.outputs[0])
             else:
-                albedoPath = [item[2] for item in self.textureList if item[1] == "albedo"]
-                if len(albedoPath) >= 1:
-                    use_diffuse = False
-                    #Import albedo and albedo node setup.
-                    albedoPath = albedoPath[0].replace("\\", "/")
-                    albedoNode = nodes.new('ShaderNodeTexImage')
-                    albedoNode.location = (-640, 420)
-                    albedoNode.image = bpy.data.images.load(albedoPath)
-                    albedoNode.show_texture = True
-                    albedoNode.image.colorspace_settings.name = colorSpaces[0]
-                    # Connect albedo node to the material parent node.
-                    mat.node_tree.links.new(nodes.get(parentName).inputs[0], albedoNode.outputs[0])
+                self.mat.node_tree.links.new(bumpNode.inputs[5], normalNode.outputs[0])
+            # Add bumpNode connection to the material parent node
+            if connectToMaterial:
+                self.ConnectNodeToMaterial(materialInputIndex, bumpNode)
+        elif self.NormalSetup:
+            normalMapNode = self.CreateTextureNode("normal", -640, -207)
+            normalNode = self.CreateGenericNode("ShaderNodeNormalMap", -250, -170)
+            # Add normalMapNode to normalNode connection
+            self.mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
+            # Add normalNode connection to the material parent node
+            if connectToMaterial:
+                self.ConnectNodeToMaterial(materialInputIndex, normalNode)
+        elif self.BumpSetup:
+            bumpMapNode = self.CreateTextureNode("bump", -640, -207)
+            bumpNode = self.CreateGenericNode("ShaderNodeBump", -250, -170)
+            bumpNode.inputs[0].default_value = 0.1
+            # Add bumpMapNode and normalNode connection to the bumpNode
+            self.mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
+            # Add bumpNode connection to the material parent node
+            if connectToMaterial:
+                self.ConnectNodeToMaterial(materialInputIndex, bumpNode)
 
-        # Create the diffuse setup.
-        if "diffuse" in maps_ and use_diffuse:
-            diffusePath = [item[2] for item in self.textureList if item[1] == "diffuse"]
-            if len(diffusePath) >= 1:
-                # Import diffuse and diffuse node setup.
-                diffusePath = diffusePath[0].replace("\\", "/")
-                diffuseNode = nodes.new('ShaderNodeTexImage')
-                diffuseNode.location = (-640, 420)
-                diffuseNode.image = bpy.data.images.load(diffusePath)
-                diffuseNode.show_texture = True
-                diffuseNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect diffuse node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[0], diffuseNode.outputs[0])
-        
-        use_metalness = True
-        # Create the specular setup.
-        if "specular" in maps_:
-            specularPath = [item[2] for item in self.textureList if item[1] == "specular"]
-            if len(specularPath) >= 1:
-                use_metalness = False
-                # Import specular and specular node setup.
-                specularPath = specularPath[0].replace("\\", "/")
-                specularNode = nodes.new('ShaderNodeTexImage')
-                specularNode.location = (-1150, 200)
-                specularNode.image = bpy.data.images.load(specularPath)
-                specularNode.show_texture = True
-                specularNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect specular node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[5], specularNode.outputs[0])
+    def CreateDisplacementSetup(self, connectToMaterial):
+        if self.DisplacementSetup == "adaptive":
+            # Add vector>displacement map node
+            displacementNode = self.CreateGenericNode("ShaderNodeDisplacement", 10, -400)
+            displacementNode.inputs[0].default_value = 0.1
+            displacementNode.inputs[1].default_value = 0
+            # Add converter>RGB Separator node
+            RGBSplitterNode = self.CreateGenericNode("ShaderNodeSeparateRGB", -250, -499)
+            # Import normal map and normal map node setup.
+            displacementMapNode = self.CreateTextureNode("displacement", -640, -740)
+            # Add displacementMapNode to RGBSplitterNode connection
+            self.mat.node_tree.links.new(RGBSplitterNode.inputs[0], displacementMapNode.outputs[0])
+            # Add RGBSplitterNode to displacementNode connection
+            self.mat.node_tree.links.new(displacementNode.inputs[2], RGBSplitterNode.outputs[0])
+            # Add normalNode connection to the material output displacement node
+            if connectToMaterial:
+                self.mat.node_tree.links.new(self.nodes.get(self.materialOutputName).inputs[2], displacementNode.outputs[0])
+                self.mat.cycles.displacement_method = 'BOTH'
 
-        # Create the metalness setup. Use metalness if specular is missing
-        if "metalness" in maps_ and use_metalness:
-            metalnessPath = [item[2] for item in self.textureList if item[1] == "metalness"]
-            if len(metalnessPath) >= 1:
-                # Import specular and specular node setup.
-                metalnessPath = metalnessPath[0].replace("\\", "/")
-                metalnessNode = nodes.new('ShaderNodeTexImage')
-                metalnessNode.location = (-1150, 200)
-                metalnessNode.image = bpy.data.images.load(metalnessPath)
-                metalnessNode.show_texture = True
-                metalnessNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect specular node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[4], metalnessNode.outputs[0])
+        if self.DisplacementSetup == "regular":
+            pass        
 
-        use_gloss = True
-        # Create the roughness setup.
-        if "roughness" in maps_:
-            roughnessPath = [item[2] for item in self.textureList if item[1] == "roughness"]
-            if len(roughnessPath) >= 1:
-                use_gloss = False
-                # Import roughness and roughness node setup.
-                roughnessPath = roughnessPath[0].replace("\\", "/")
-                roughnessNode = nodes.new('ShaderNodeTexImage')
-                roughnessNode.location = (-1150, -60)
-                roughnessNode.image = bpy.data.images.load(roughnessPath)
-                roughnessNode.show_texture = True
-                roughnessNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect roughness node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[7], roughnessNode.outputs[0])
-        
-        # Create the gloss setup.
-        if "gloss" in maps_ and use_gloss:
-            glossPath = [item[2] for item in self.textureList if item[1] == "gloss"]
-            if len(glossPath) >= 1:
-                # Add vector>bump node
-                invertNode = nodes.new("ShaderNodeInvert")
-                invertNode.location = (-250, 68)
-                # Import roughness and roughness node setup.
-                glossPath = glossPath[0].replace("\\", "/")
-                glossNode = nodes.new('ShaderNodeTexImage')
-                glossNode.location = (-1150, -60)
-                glossNode.image = bpy.data.images.load(glossPath)
-                glossNode.show_texture = True
-                glossNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add glossNode to invertNode connection
-                mat.node_tree.links.new(invertNode.inputs[1], glossNode.outputs[0])
-                # Connect roughness node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[7], invertNode.outputs[0])
+    def ConnectNodeToMaterial(self, materialInputIndex, textureNode):
+        self.mat.node_tree.links.new(self.nodes.get(self.parentName).inputs[materialInputIndex], textureNode.outputs[0])
 
-        # Create the opacity setup.
-        if "opacity" in maps_:
-            opacityPath = [item[2] for item in self.textureList if item[1] == "opacity"]
-            if len(opacityPath) >= 1:
-                # Import opacity and opacity node setup.
-                opacityPath = opacityPath[0].replace("\\", "/")
-                opacityNode = nodes.new('ShaderNodeTexImage')
-                opacityNode.location = (-1550, -160)
-                opacityNode.image = bpy.data.images.load(opacityPath)
-                opacityNode.show_texture = True
-                opacityNode.image.colorspace_settings.name = colorSpaces[1]
-                # Connect opacity node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[18], opacityNode.outputs[0])
+    def CreateGenericNode(self, nodeName, PosX, PosY):
+        genericNode = self.nodes.new(nodeName)
+        genericNode.location = (PosX, PosY)
+        return genericNode
 
-        # Create the translucency setup.
-        if "translucency" in maps_:
-            translucencyPath = [item[2] for item in self.textureList if item[1] == "translucency"]
-            if len(translucencyPath) >= 1:
-                # Import translucency and translucency node setup.
-                translucencyPath = translucencyPath[0].replace("\\", "/")
-                translucencyNode = nodes.new('ShaderNodeTexImage')
-                translucencyNode.location = (-1550, -420)
-                translucencyNode.image = bpy.data.images.load(translucencyPath)
-                translucencyNode.show_texture = True
-                translucencyNode.image.colorspace_settings.name = colorSpaces[0]
-                # Connect translucency node to the material parent node.
-                mat.node_tree.links.new(nodes.get(parentName).inputs[15], translucencyNode.outputs[0])
+    def GetTexturePath(self, textureType):
+        for item in self.textureList:
+            if item[1] == textureType:
+                return item[2].replace("\\", "/")
 
-        setup_normal = True
-        # Create the normal + bump setup.
-        if "normal" in maps_ and "bump" in maps_:
-            normalPath = [item[2] for item in self.textureList if item[1] == "normal"]
-            bumpPath = [item[2] for item in self.textureList if item[1] == "bump"]
-            if len(normalPath) >= 1 and  len(bumpPath) >= 1:
-                setup_normal = False
-                # Add vector>bump node
-                bumpNode = nodes.new("ShaderNodeBump")
-                bumpNode.location = (-250, -170)
-                bumpNode.inputs[0].default_value = 0.1
-                # Import bump map and bump map node setup.
-                bumpPath = bumpPath[0].replace("\\", "/")
-                bumpMapNode = nodes.new('ShaderNodeTexImage')
-                bumpMapNode.location = (-640, -130)
-                bumpMapNode.image = bpy.data.images.load(bumpPath)
-                bumpMapNode.show_texture = True
-                bumpMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add vector>normal map node
-                normalNode = nodes.new("ShaderNodeNormalMap")
-                normalNode.location = (-640, -400)
-                # Import normal map and normal map node setup.
-                normalPath = normalPath[0].replace("\\", "/")
-                normalMapNode = nodes.new('ShaderNodeTexImage')
-                normalMapNode.location = (-1150, -580)
-                normalMapNode.image = bpy.data.images.load(normalPath)
-                normalMapNode.show_texture = True
-                normalMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add normalMapNode to normalNode connection
-                mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
-                # Add bumpMapNode and normalNode connection to the bumpNode
-                mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
-                mat.node_tree.links.new(bumpNode.inputs[3], normalNode.outputs[0])
-                # Add bumpNode connection to the material parent node
-                mat.node_tree.links.new(nodes.get(parentName).inputs[19], bumpNode.outputs[0])
-
-        # Create the normal setup if the LiveLink did not setup normal + bump.
-        if "normal" in maps_ and setup_normal:
-            normalPath = [item[2] for item in self.textureList if item[1] == "normal"]
-            if len(normalPath) >= 1:
-                setup_normal = False
-                # Add vector>normal map node
-                normalNode = nodes.new("ShaderNodeNormalMap")
-                normalNode.location = (-250, -170)
-                # Import normal map and normal map node setup.
-                normalPath = normalPath[0].replace("\\", "/")
-                normalMapNode = nodes.new('ShaderNodeTexImage')
-                normalMapNode.location = (-640, -207)
-                normalMapNode.image = bpy.data.images.load(normalPath)
-                normalMapNode.show_texture = True
-                normalMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add normalMapNode to normalNode connection
-                mat.node_tree.links.new(normalNode.inputs[1], normalMapNode.outputs[0])
-                # Add normalNode connection to the material parent node
-                mat.node_tree.links.new(nodes.get(parentName).inputs[19], normalNode.outputs[0])
-
-        # Create the normal setup if the LiveLink did not setup normal + bump.
-        if "bump" in maps_ and setup_normal:
-            bumpPath = [item[2] for item in self.textureList if item[1] == "bump"]
-            if len(bumpPath) >= 1:
-                setup_normal = False
-                # Add vector>bump node
-                bumpNode = nodes.new("ShaderNodeBump")
-                bumpNode.location = (-250, -170)
-                bumpNode.inputs[0].default_value = 0.1
-                # Import bump map and bump map node setup.
-                bumpPath = bumpPath[0].replace("\\", "/")
-                bumpMapNode = nodes.new('ShaderNodeTexImage')
-                bumpMapNode.location = (-640, -207)
-                bumpMapNode.image = bpy.data.images.load(bumpPath)
-                bumpMapNode.show_texture = True
-                bumpMapNode.image.colorspace_settings.name = colorSpaces[1]
-                # Add bumpMapNode and normalNode connection to the bumpNode
-                mat.node_tree.links.new(bumpNode.inputs[2], bumpMapNode.outputs[0])
-                # Add bumpNode connection to the material parent node
-                mat.node_tree.links.new(nodes.get(parentName).inputs[19], bumpNode.outputs[0])
-    
-        # Create the displacement setup.
-        if "displacement" in maps_:
-            if self.DisplacementSetup == "adaptive":
-                displacementPath = [item[2] for item in self.textureList if item[1] == "displacement"]
-                if len(displacementPath) >= 1:
-                    # Add vector>displacement map node
-                    displacementNode = nodes.new("ShaderNodeDisplacement")
-                    displacementNode.location = (10, -400)
-                    displacementNode.inputs[0].default_value = 0.1
-                    displacementNode.inputs[1].default_value = 0
-                    # Add converter>RGB Separator node
-                    RGBSplitterNode = nodes.new("ShaderNodeSeparateRGB")
-                    RGBSplitterNode.location = (-250, -499)
-                    # Import normal map and normal map node setup.
-                    displacementPath = displacementPath[0].replace("\\", "/")
-                    displacementMapNode = nodes.new('ShaderNodeTexImage')
-                    displacementMapNode.location = (-640, -740)
-                    displacementMapNode.image = bpy.data.images.load(displacementPath)
-                    displacementMapNode.show_texture = True
-                    displacementMapNode.image.colorspace_settings.name = colorSpaces[1]
-                    # Add displacementMapNode to RGBSplitterNode connection
-                    mat.node_tree.links.new(RGBSplitterNode.inputs[0], displacementMapNode.outputs[0])
-                    # Add RGBSplitterNode to displacementNode connection
-                    mat.node_tree.links.new(displacementNode.inputs[2], RGBSplitterNode.outputs[0])
-                    # Add normalNode connection to the material output displacement node
-                    mat.node_tree.links.new(nodes.get(materialOutputName).inputs[2], displacementNode.outputs[0])
-                    mat.cycles.displacement_method = 'BOTH'
-
-            if self.DisplacementSetup == "regular":
-                pass
-        return
+    def GetTextureFormat(self, textureType):
+        for item in self.textureList:
+            if item[1] == textureType:
+                return item[0].lower()
 
 class ms_Init(threading.Thread):
     
@@ -1429,7 +497,7 @@ class ms_Init(threading.Thread):
                             self.importer(self.TotalData)
                             break
         except Exception as e:
-            print( "Megascans LiveLink Error initializing the thread. Error: ", str(e) )
+            print( "Megascans Plugin Error initializing the thread. Error: ", str(e) )
 
 class thread_checker(threading.Thread):
     
@@ -1454,13 +522,13 @@ class thread_checker(threading.Thread):
                         run_checker = False
                         break
         except Exception as e:
-            print( "Megascans LiveLink Error initializing thread checker. Error: ", str(e) )
+            print( "Megascans Plugin Error initializing thread checker. Error: ", str(e) )
             pass
 
 class MS_Init_LiveLink(bpy.types.Operator):
 
-    bl_idname = "ms_livelink.py"
-    bl_label = "Megascans LiveLink"
+    bl_idname = "bridge.plugin"
+    bl_label = "Megascans Plugin"
     socketCount = 0
 
     def execute(self, context):
@@ -1472,7 +540,7 @@ class MS_Init_LiveLink(bpy.types.Operator):
             bpy.app.timers.register(self.newDataMonitor)
             return {'FINISHED'}
         except Exception as e:
-            print( "Megascans LiveLink error starting blender plugin. Error: ", str(e) )
+            print( "Megascans Plugin Error starting blender plugin. Error: ", str(e) )
             return {"FAILED"}
 
     def newDataMonitor(self):
@@ -1481,7 +549,7 @@ class MS_Init_LiveLink(bpy.types.Operator):
                 MS_Init_ImportProcess()
                 globals()['Megascans_DataSet'] = None       
         except Exception as e:
-            print( "Megascans LiveLink error starting blender plugin (newDataMonitor). Error: ", str(e) )
+            print( "Megascans Plugin Error starting blender plugin (newDataMonitor). Error: ", str(e) )
             return {"FAILED"}
         return 1.0
 
@@ -1497,35 +565,88 @@ class MS_Init_LiveLink(bpy.types.Operator):
             #Start the newly created thread.
             thread_checker_.start()
         except Exception as e:
-            print( "Megascans LiveLink error starting blender plugin (socketMonitor). Error: ", str(e) )
+            print( "Megascans Plugin Error starting blender plugin (socketMonitor). Error: ", str(e) )
             return {"FAILED"}
 
     def importer (self, recv_data):
         try:
             globals()['Megascans_DataSet'] = recv_data
         except Exception as e:
-            print( "Megascans LiveLink error starting blender plugin (importer). Error: ", str(e) )
+            print( "Megascans Plugin Error starting blender plugin (importer). Error: ", str(e) )
             return {"FAILED"}
-        
-def show_error_dialog(self, context, message = "Test message."):
-     self.report({'INFO'}, message)
+
+class MS_Init_Abc(bpy.types.Operator):
+
+    bl_idname = "ms_livelink_abc.py"
+    bl_label = "Import ABC"
+
+    def execute(self, context):
+
+        try:
+            if globals()['MG_ImportComplete']:
+                
+                assetMeshPaths = globals()['MG_AlembicPath']
+                assetMaterials = globals()['MG_Material']
+                
+                if len(assetMeshPaths) > 0 and len(assetMaterials) > 0:
+
+                    materialIndex = 0
+                    old_materials = []
+                    for meshPaths in assetMeshPaths:
+                        for meshPath in meshPaths:
+                            bpy.ops.wm.alembic_import(filepath=meshPath, as_background_job=False)
+                            for o in bpy.context.scene.objects:
+                                if o.select_get():
+                                    old_materials.append(o.active_material)
+                                    o.active_material = assetMaterials[materialIndex]
+                                    
+                        
+                        materialIndex += 1
+                    
+                    for mat in old_materials:
+                        try:
+                            if mat is not None:
+                                bpy.data.materials.remove(mat)
+                        except:
+                            pass
+
+                    globals()['MG_AlembicPath'] = []
+                    globals()['MG_Material'] = []
+                    globals()['MG_ImportComplete'] = False
+
+            return {'FINISHED'}
+        except Exception as e:
+            print( "Megascans Plugin Error starting MS_Init_Abc. Error: ", str(e) )
+            return {"CANCELLED"}
+
+@persistent
+def load_plugin(scene):
+    try:
+        bpy.ops.bridge.plugin()
+    except Exception as e:
+        print( "Bridge Plugin Error::Could not start the plugin. Description: ", str(e) )
 
 def menu_func_import(self, context):
-    self.layout.operator(MS_Init_LiveLink.bl_idname, text="Megascans LiveLink")
+    self.layout.operator(MS_Init_Abc.bl_idname, text="Megascans: Import Alembic Files")
 
-def getColorspaces():
-    if os.environ.get("OCIO"):
-        return ["Utility - sRGB - Texture", "Utility - Raw"]
-    else:
-        return ["sRGB", "Non-Color"]
-
+classes_to_register = [MS_Init_LiveLink, MS_Init_Abc]
 def register():
-    bpy.utils.register_class(MS_Init_LiveLink)
+    if len(bpy.app.handlers.load_post) > 0:
+        # Check if trying to register twice.
+        if "load_plugin" in bpy.app.handlers.load_post[0].__name__.lower() or load_plugin in bpy.app.handlers.load_post:
+            return
+    for msc in classes_to_register:            
+        bpy.utils.register_class(msc)
+    
+    bpy.app.handlers.load_post.append(load_plugin)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
 
 def unregister():
-    # bpy.utils.unregister_class(MS_Init_LiveLink)
-    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
 
-if __name__ == "__main__":
-    register()
+    for msc in classes_to_register:
+        bpy.utils.unregister_class(msc)
+    bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
+    if len(bpy.app.handlers.load_post) > 0:
+        # Check if trying to register twice.
+        if "load_plugin" in bpy.app.handlers.load_post[0].__name__.lower() or load_plugin in bpy.app.handlers.load_post:
+            bpy.app.handlers.load_post.remove(load_plugin)
