@@ -1,4 +1,4 @@
-# Blender Mixer
+# Blender MSLink
 ![](doc/example-compressor.png)
 
 ---
