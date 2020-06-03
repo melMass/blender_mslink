@@ -3,14 +3,23 @@
 
 ---
 
+## Install
+
 This is an almost 1:1 fork of **Quixel's official Megascan Live Link** for Blender 2.80+
 
+- Quit Blender
+- Remove the official addon if installed (located in the startup folder (`MSLink`))
+- Clone this repository to your addons folder
+- Launch Blender and activate the Megascans addon.
+- That's it, you can now send anything from Bridge.
+
+
+## Why a fork ?
 The initial reason was to support ACES when detected:
 - **sRGB** -> Utility - sRGB - Texture
 - **Linear** -> Utility - Linear - sRGB
 - **Non-Color** -> Utility - Raw
 
+### Roadmap
 
-### Planned Features
-
-- [ ] Add LuxCore Support (it already works thanks to LuxCore translation, but I want to add a dedicated LuxCore hook )
+Now hosted on Notion [here](https://is.gd/aCA8CE)
